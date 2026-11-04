@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# pibox — run the pi coding agent in an isolated Docker container.
+# Usage and settings: see cmd_help below, or run `pibox --help`.
+#
+# Each session is three short-lived Docker objects, named after the folder:
+#   <name>-net     an --internal network: no internet, no route to the Mac or your LAN
+#   <name>-ollama  pibox-proxy.py, the only thing on that network besides the box. It
+#                  forwards chat with your local Ollama models and refuses the rest.
+#   <name>         the box itself: read-only system, only this folder mounted, .git
+#                  read-only, pi's config in a volume of its own (<name>-config).
+set -euo pipefail
+
+IMAGE="${PIBOX_IMAGE:-pibox:latest}"
+INSTALL_URL="https://raw.githubusercontent.com/mjme/pibox/main/install.sh"
+MIN_DESKTOP="4.44.3"               # fixes CVE-2025-9074 (containers reaching the Engine API)
+GIT_DEPTH=5                        # how deep to look for .git folders in the project
+
+# Your Mac's pi config folder. Only the items listed below are shared with the box, each
+# read-only. Everything else (auth.json, sessions/, models.json, mcp.json, …) can hold
+# credentials or Mac-only files, so it never goes in.
+HOST_PI_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+REAL_HOME="$(cd -P "$HOME" 2>/dev/null && pwd || echo "$HOME")"
+SHARED_FILES=" settings.json keybindings.json AGENTS.override.md AGENTS.md AGENTS.MD CLAUDE.md CLAUDE.MD SYSTEM.md APPEND_SYSTEM.md "
+SHARED_DIRS=" skills prompts themes extensions "
+
+# Folders pibox will never mount, or run inside of (relative to your home folder).
+SENSITIVE=(Library .ssh .gnupg .aws .azure .config .docker .kube .pi .local .netrc)
+
+# Resolve this script's real directory (works through symlinks, no GNU readlink).
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  d="$(cd -P "$(dirname "$src")" && pwd)"; src="$(readlink "$src")"
+  [[ $src != /* ]] && src="$d/$src"
+done
+HERE="$(cd -P "$(dirname "$src")" && pwd)"
+
+c_dim=$'\e[2m'; c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_red=$'\e[31m'; c_bold=$'\e[1m'; c_off=$'\e[0m'
+say()  { printf '%s▸%s %s\n' "$c_grn" "$c_off" "$*" >&2; }
+warn() { printf '%s!%s %s\n' "$c_ylw" "$c_off" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
+exists()  { docker inspect "$1" >/dev/null 2>&1; }
+
+# Docker's --mount takes comma-separated fields, so a path with a comma, quote or
+# newline in it can't be passed safely. pibox refuses those instead of guessing.
+mountable() { [[ $1 != *[,\"$'\n']* ]]; }
+
+# One box per folder: pibox-<folder name>-<hash of full path>, so it's readable
+# in `docker ps` and two folders with the same name never collide.
+container_name() {
+  local base hash
+  base="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_.-' '-' | cut -c1-30)"
+  hash="$(printf '%s' "$1" | shasum -a 256 | cut -c1-8)"
+  echo "pibox-$base-$hash"
+}
+
+# Work out which of your pi customizations to share. Sets SHARED (item names) and
+# SHARE_MOUNTS (docker --mount args, all read-only). It lists the folder instead of
+# testing each name, because macOS ignores case: testing for AGENTS.MD would also match
+# AGENTS.md and put the same file in the box twice under two names.
+find_shared_config() {
+  SHARED=(); SHARE_MOUNTS=()
+  [ "${PIBOX_SHARE_CONFIG:-1}" = 0 ] && return 0
+  [ -d "$HOST_PI_DIR" ] || return 0
+  mountable "$HOST_PI_DIR" || { warn "Not sharing $HOST_PI_DIR: its path contains a comma or quote."; return 0; }
+
+  local src item real pi_real
+  pi_real="$(cd -P "$HOST_PI_DIR" && pwd)"
+  for src in "$HOST_PI_DIR"/*; do
+    item="${src##*/}"
+    if [[ $SHARED_FILES == *" $item "* ]] && [ -f "$src" ]; then
+      # pi writes its own settings.json, so yours goes to the side and gets merged in.
+      if [ "$item" = settings.json ]; then
+        SHARE_MOUNTS+=(--mount "type=bind,src=$src,dst=/home/node/.pi-host/settings.json,readonly")
+      else
+        SHARE_MOUNTS+=(--mount "type=bind,src=$src,dst=/home/node/.pi/agent/$item,readonly")
+      fi
+    elif [[ $SHARED_DIRS == *" $item "* ]] && [ -d "$src" ]; then
+      # A symlinked folder (e.g. into a dotfiles repo) is fine, but never one that
+      # turns out to be your whole home folder, the disk, or somewhere sensitive.
+      real="$(cd -P "$src" && pwd)"
+      if [ "$real" = / ] || [[ "$REAL_HOME/" == "$real/"* ]] || ! mountable "$real" \
+         || { [[ $real != "$pi_real/"* ]] && sensitive "$real"; }; then
+        warn "Not sharing $src: it points at $real."
+        continue
+      fi
+      SHARE_MOUNTS+=(--mount "type=bind,src=$real,dst=/home/node/.pi/agent/$item,readonly")
+    else
+      continue
+    fi
+    SHARED+=("$item")
+  done
+}
+
+# True if $1 is one of the SENSITIVE folders in your home, or inside one.
+sensitive() {
+  local p
+  for p in "${SENSITIVE[@]}"; do
+    [ "$1" = "$REAL_HOME/$p" ] || [[ $1 == "$REAL_HOME/$p/"* ]] && return 0
+  done
+  return 1
+}
+
+# Every .git (folder, or file for worktrees/submodules) in the project, up to
+# GIT_DEPTH levels deep, one per line. Skips dependency folders.
+list_git() {
+  find "$1" -maxdepth "$GIT_DEPTH" \( -name node_modules -o -name .venv -o -name venv \) -prune \
+    -o -name .git -print -prune 2>/dev/null | LC_ALL=C sort
+}
+
+# Mount every .git read-only, so the agent can't add git hooks or change git config.
+# Either of those would run its code on your Mac the next time git runs here (which
+# many shell prompts do on every `cd`). Each .git becomes a mount point, so it can't
+# be renamed or replaced either. Sets GIT_BEFORE and GIT_MOUNTS.
+protect_git() {
+  local dir="$1" g
+  GIT_MOUNTS=()
+  GIT_BEFORE="$(list_git "$dir")"
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    # A symlinked .git could point anywhere on your Mac, and Docker would follow it.
+    [ -L "$g" ] && die "Refusing to start: $g is a symlink. Check what it points at and remove it."
+    mountable "$g" || die "Refusing to start: can't protect $g (its path contains a comma or quote)."
+    GIT_MOUNTS+=(--mount "type=bind,src=$g,dst=$g,readonly")
+  done <<< "$GIT_BEFORE"
+}
+
+# After the session: warn about any .git the agent created. A new repo's hooks or
+# config could run code on your Mac when git (or your shell prompt) runs there.
+check_new_git() {
+  local new
+  new="$(LC_ALL=C comm -13 <(printf '%s\n' "$GIT_BEFORE") <(list_git "$1"))" || return 0
+  [ -n "$new" ] || return 0
+  printf '\n%s%s! pi created a new git repository in this folder:%s\n' "$c_bold" "$c_ylw" "$c_off" >&2
+  printf '%s\n' "$new" | sed 's/^/    /' >&2
+  warn "Its hooks or config could run code on your Mac when git runs there, and some"
+  warn "shell prompts run git automatically. Inspect it before you cd into it or use git there,"
+  warn "or delete it with: rm -rf <path>"
+}
+
+cmd_help() {
+  cat <<'EOF'
+pibox ✨🍰✨  Run the pi coding agent in an isolated Docker container that only sees
+this folder and has no internet access.
+
+Usage:
+  pibox                  open pi for the current folder
+  pibox [pi options]     same, passing options to pi, e.g. pibox --model qwen3.5:9b
+  pibox shell            open a bash shell in the box instead of pi (same isolation)
+  pibox update           update pibox and pi to the latest versions
+  pibox rebuild          rebuild the box (pibox update does this for you)
+  pibox --help           show this help
+
+  Each folder gets its own box, thrown away when you quit pi. You can run pibox in
+  several folders at once, but only once per folder.
+
+What the box can reach:
+  This folder (read-write), except .git, which is read-only: commit on your Mac.
+  Your local Ollama models, through a filter that only allows chat.
+  Nothing else: no internet, no other folders, no other services on your Mac.
+
+Models:
+  Download one with `ollama pull <model>`. pibox picks it up the next time it starts.
+  Switch models with pi's model picker. Ollama cloud models are hidden.
+
+Settings (put them before the command, e.g. PIBOX_MEMORY=16g pibox):
+  PIBOX_MEMORY=8g        memory limit for each box
+  PIBOX_CPUS=4           CPU limit for each box
+  PIBOX_CONTEXT=32768    context window pi assumes for each model
+  PI_VERSION=latest      pi version to install, used by `pibox rebuild`
+  PIBOX_SHARE_CONFIG=0   don't share your Mac's pi config with the box
+
+Your pi config:
+  pibox shares these from ~/.pi/agent (or $PI_CODING_AGENT_DIR), read-only:
+    settings.json, keybindings.json, AGENTS.md, CLAUDE.md, SYSTEM.md,
+    APPEND_SYSTEM.md, skills/, prompts/, themes/, extensions/
+  It never shares auth.json, sessions/, models.json, mcp.json or trust.json.
+  pibox chooses the model, so your Mac's default model isn't copied.
+  Each folder keeps its own pi sessions and settings in a Docker volume
+  named pibox-<folder>-<hash>-config.
+
+Context length:
+  Ollama's default context window is small, and agents quickly overflow it.
+  To raise it, run:
+    launchctl setenv OLLAMA_CONTEXT_LENGTH 32768
+    brew services restart ollama
+  and set PIBOX_CONTEXT to the same number.
+EOF
+}
+
+# Rerun the installer from GitHub. `exec` replaces this script first, because the
+# installer overwrites this very file and bash reads scripts as it runs them.
+cmd_update() {
+  say "Updating pibox…"
+  exec bash -c 'set -o pipefail; curl -fsSL "$1" | bash' _ "$INSTALL_URL"
+}
+
+cmd_rebuild() {
+  local version="${PI_VERSION:-latest}"
+  # Docker caches the npm install step, so building with "latest" would keep the old
+  # pi forever. Look up the real version number so the cache refreshes exactly when
+  # a new pi is out. If the lookup fails (offline), fall back to "latest".
+  if [ "$version" = latest ]; then
+    version="$(curl -fsS -m 10 https://registry.npmjs.org/@earendil-works/pi-coding-agent/latest 2>/dev/null \
+      | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)" || true
+    [ -n "$version" ] || version=latest
+  fi
+  say "Building $IMAGE (pi $version)…"
+  docker build --pull -t "$IMAGE" --build-arg "PI_VERSION=$version" "$HERE"
+}
+
+ensure_ollama() {
+  if ! curl -fsS -m 2 http://localhost:11434/api/version >/dev/null 2>&1; then
+    warn "Ollama isn't answering on localhost:11434. Start it with: brew services start ollama"
+  fi
+}
+
+# Is version $1 older than $2? (dotted numbers, e.g. 4.44.3)
+version_lt() {
+  local IFS=. i a b
+  read -r -a a <<< "$1"; read -r -a b <<< "$2"
+  for i in 0 1 2; do
+    [ "${a[i]:-0}" -lt "${b[i]:-0}" ] && return 0
+    [ "${a[i]:-0}" -gt "${b[i]:-0}" ] && return 1
+  done
+  return 1
+}
+
+check_docker_desktop() {
+  local v
+  v="$(docker version --format '{{.Server.Platform.Name}}' 2>/dev/null \
+    | sed -n 's/^Docker Desktop \([0-9][0-9.]*\).*/\1/p')"
+  if [ -n "$v" ] && version_lt "$v" "$MIN_DESKTOP"; then
+    warn "Docker Desktop $v has a known flaw that lets containers control Docker (CVE-2025-9074)."
+    warn "Update Docker Desktop to $MIN_DESKTOP or newer."
+  fi
+}
+
+# Remove this folder's box, proxy and network. Safe to call when they don't exist.
+teardown() {
+  local name="$1"
+  docker rm -f "$name" "$name-ollama" >/dev/null 2>&1 || true
+  docker network rm "$name-net" >/dev/null 2>&1 || true
+}
+
+# Create the folder's network, config volume and Ollama proxy.
+setup() {
+  local dir="$1" name="$2"
+  docker network create --internal --label "pibox.dir=$dir" "$name-net" >/dev/null
+  docker volume create --label "pibox.dir=$dir" "$name-config" >/dev/null
+  docker run -d --rm --name "$name-ollama" --hostname pibox-ollama \
+    --label "pibox.dir=$dir" \
+    --network bridge --add-host host.docker.internal:host-gateway \
+    --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit 64 --memory 128m --cpus 1 \
+    --entrypoint python3 "$IMAGE" /usr/local/bin/pibox-proxy.py >/dev/null
+  docker network connect --alias ollama "$name-net" "$name-ollama"
+}
+
+# Run pi (or, with mode=shell, bash) in a fresh box for the current folder.
+cmd_box() {
+  local mode="$1"; shift
+  local dir name
+  dir="$(pwd -P)"
+  [ "$dir" = / ] && die "Refusing to mount /."
+  [ "$dir" = "$REAL_HOME" ] && die "Refusing to mount your whole home folder. cd into a project first."
+  [[ "$REAL_HOME/" == "$dir/"* ]] && die "Refusing to mount $dir: it contains your home folder. cd into a project first."
+  sensitive "$dir" && die "Refusing to mount $dir: it can hold credentials or settings for your Mac."
+  mountable "$dir" || die "Refusing to mount $dir: its path contains a comma or quote, which Docker can't mount safely."
+  name="$(container_name "$dir")"
+
+  if running "$name"; then
+    warn "pibox is already running for this folder (probably in another terminal window)."
+    warn "Switch to that window, or stop it with: ${c_dim}docker rm -f $name${c_off}"
+    exit 1
+  fi
+
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || cmd_rebuild
+  check_docker_desktop
+  ensure_ollama
+  find_shared_config
+  protect_git "$dir"
+  if [ ${#SHARED[@]} -gt 0 ]; then
+    say "Sharing from ${HOST_PI_DIR/#$HOME/~} (read-only): ${c_dim}$(IFS=,; echo "${SHARED[*]}" | sed 's/,/, /g')${c_off}"
+  fi
+
+  teardown "$name"   # leftovers from a session that didn't exit cleanly
+  trap 'teardown "$name"' EXIT
+  trap 'exit 130' INT TERM HUP
+  setup "$dir" "$name"
+
+  local entry=(); [ "$mode" = shell ] && entry=(--entrypoint bash)
+  # Real TTY (resizes with your window) and truecolor, so pi feels native.
+  local tty=(-i); [ -t 0 ] && [ -t 1 ] && tty=(-it)
+  local status=0
+  docker run --rm "${tty[@]}" --name "$name" --hostname pibox \
+    --label "pibox.dir=$dir" \
+    --network "$name-net" --dns 127.0.0.1 \
+    --init --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+    --tmpfs /home/node:rw,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=0755 \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit 1024 \
+    --memory "${PIBOX_MEMORY:-8g}" --cpus "${PIBOX_CPUS:-4}" \
+    --mount "type=bind,src=$dir,dst=$dir" -w "$dir" \
+    ${GIT_MOUNTS[@]+"${GIT_MOUNTS[@]}"} \
+    --mount "type=volume,src=$name-config,dst=/home/node/.pi" \
+    ${SHARE_MOUNTS[@]+"${SHARE_MOUNTS[@]}"} \
+    -e OLLAMA_BASE_URL=http://ollama:11434 \
+    -e PIBOX_CONTEXT="${PIBOX_CONTEXT:-32768}" \
+    -e TERM=xterm-256color -e COLORTERM=truecolor \
+    ${entry[@]+"${entry[@]}"} "$IMAGE" "$@" || status=$?
+
+  check_new_git "$dir"
+  exit "$status"
+}
+
+# These work without Docker running.
+case "${1:-}" in
+  -h|--help) cmd_help; exit 0 ;;
+  update)    cmd_update ;;
+esac
+
+command -v docker >/dev/null || die "Docker isn't installed."
+docker info >/dev/null 2>&1 || die "Docker isn't running. Start Docker Desktop."
+
+case "${1:-}" in
+  rebuild) cmd_rebuild; say "Done. Each folder's box uses the new image the next time pibox starts there." ;;
+  shell)   shift; cmd_box shell "$@" ;;
+  *)       cmd_box pi "$@" ;;   # anything else (including nothing) is passed straight to pi
+esac

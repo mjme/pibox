@@ -1,0 +1,5 @@
+#!/bin/sh
+# Entry point of the box: bring pi's model list in line with Ollama, then start pi.
+# Arguments are passed straight to pi.
+python3 /usr/local/bin/pibox-init.py || true
+exec pi "$@"
