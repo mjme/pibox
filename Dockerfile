@@ -39,6 +39,10 @@ ENV LANG=en_US.UTF-8 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PATH=/home/node/.local/bin:$PATH
 
+# Which `pibox` script this image is built for. pibox rebuilds the image when this
+# doesn't match its own IMAGE_API, so the script and image always come from the same version.
+LABEL pibox.api="2"
+
 USER node
 WORKDIR /home/node
 ENTRYPOINT ["/usr/local/bin/pibox-entry"]

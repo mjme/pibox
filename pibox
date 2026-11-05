@@ -9,8 +9,10 @@
 #   <name>         the box itself: read-only system, only this folder mounted, .git
 #                  read-only, pi's config in a volume of its own (<name>-config).
 set -euo pipefail
+export DOCKER_CLI_HINTS=false      # no "What's next" adverts from the Docker CLI
 
 IMAGE="${PIBOX_IMAGE:-pibox:latest}"
+IMAGE_API=2                        # must match LABEL pibox.api in the Dockerfile
 INSTALL_URL="https://raw.githubusercontent.com/mjme/pibox/main/install.sh"
 MIN_DESKTOP="4.44.3"               # fixes CVE-2025-9074 (containers reaching the Engine API)
 GIT_DEPTH=5                        # how deep to look for .git folders in the project
@@ -237,6 +239,15 @@ check_docker_desktop() {
   fi
 }
 
+# Put the terminal back how pi found it. pi does this itself when it quits normally,
+# but if the box is killed, the terminal is left sending key codes like `;1:3u` (kitty
+# keyboard protocol) or mouse events to your shell. Harmless if pi already cleaned up.
+restore_terminal() {
+  [ -t 1 ] || return 0
+  printf '\e[<u\e[>4;0m\e[?1004l\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?2004l\e[?25h'
+  [ -t 0 ] && stty sane 2>/dev/null || true
+}
+
 # Remove this folder's box, proxy and network. Safe to call when they don't exist.
 teardown() {
   local name="$1"
@@ -276,7 +287,11 @@ cmd_box() {
     exit 1
   fi
 
-  docker image inspect "$IMAGE" >/dev/null 2>&1 || cmd_rebuild
+  # Build the image if it's missing, or was built for a different pibox version.
+  if [ "$(docker image inspect -f '{{index .Config.Labels "pibox.api"}}' "$IMAGE" 2>/dev/null)" != "$IMAGE_API" ]; then
+    docker image inspect "$IMAGE" >/dev/null 2>&1 && say "The box image is from a different pibox version. Rebuilding it."
+    cmd_rebuild
+  fi
   check_docker_desktop
   ensure_ollama
   find_shared_config
@@ -311,6 +326,7 @@ cmd_box() {
     -e PIBOX_CONTEXT="${PIBOX_CONTEXT:-32768}" \
     -e TERM=xterm-256color -e COLORTERM=truecolor \
     ${entry[@]+"${entry[@]}"} "$IMAGE" "$@" || status=$?
+  restore_terminal
 
   check_new_git "$dir"
   exit "$status"
